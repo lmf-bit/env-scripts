@@ -31,7 +31,8 @@ def generate_custom_path(stdout_file: str, custom_filename: str) -> str:
     return custom_path
 
 class Case:
-    def __init__(self, name: str, cmd: str, pid: int, monitor_file: str, conn: Connection, proc) -> None:
+    def __init__(self, name: str, cmd: str, pid: int, monitor_file: str, conn: Connection, proc: subprocess.Popen) -> None:
+        # using pid has problem
         self.name = name
         self.cmd = cmd
         self.pid = pid
@@ -42,12 +43,16 @@ class Case:
         self.start_time = time.time()
         self.elapsed_time = 0.0
     
-    def stop(self):
+    def kill(self, user_name: str, ip: str) -> None:
+        self.proc.terminate()
+        subprocess.run(f'ssh {user_name}@{ip} pkill -u {user_name} -f emu', shell=True)
+
+    def stop_timer(self):
         if self.start_time is not None:
             self.elapsed_time += time.time() - self.start_time
             self.start_time = None
 
-    def reset(self):
+    def reset_timer(self):
         self.start_time = None
         self.elapsed_time = 0.0
 
@@ -61,11 +66,18 @@ class Case:
         if self.proc.poll() is None:
             return None
         try:
+             # Check if the file exists before attempting to 'cat' it
+            check_file_exists = self.conn.run(f'test -f {self.monitor_file}', hide=True, warn=True)
+
+            if check_file_exists.failed:
+                return None
+            
             result = self.conn.run(f'cat {self.monitor_file}', hide=True)
             contents = result.stdout
             if 'exit_code' in contents:
-                code = int(contents.split(':')[-1])
+                code = int(contents.split(':')[-1].split('E')[0])
                 self.code = code
+                print(f'exit code: {code}')
                 return code
         except Exception as e:
             print(f"Error retrieving exit code: {e}")
@@ -98,10 +110,10 @@ class Server2:
         cores_per_cpu = int(self.conn.run('cat /proc/cpuinfo| grep "cpu cores"| uniq', hide=True).stdout.split(':')[-1])
         self.cpu_cores = cores_per_cpu * self.cpu_num
         self.is_smt = self.cpu_cores < self.cpu_threads
-        # print(f'cpu num: {self.cpu_num}, threads: {self.cpu_threads}, cpu_cores: {self.cpu_cores}, is_smt: {self.is_smt}')
-        self.success_test: list[Case] = []
-        self.failed_test: list[Case] = []
-        self.pending_test: list[Case] = []
+        print(f'ip: {ip}, cpu num: {self.cpu_num}, threads: {self.cpu_threads}, cpu_cores: {self.cpu_cores}, is_smt: {self.is_smt}')
+        self.success_tests: list[Case] = []
+        self.failed_tests: list[Case] = []
+        self.pending_tests: list[Case] = []
 
     def test_connection(self, retries: int = 5, delay: int = 2) -> bool:
         """
@@ -148,19 +160,19 @@ class Server2:
             return False
 
     def check_running(self):
-        for case in self.pending_test:
+        for case in self.pending_tests:
             res = case.get_exit_code()
             if res is not None:
-                self.pending_test.remove(res)
+                self.pending_tests.remove(res)
                 if res != 0:
                     print(f"[ERROR] {case.name} exit with code {res}")
-                    self.failed_test.append()
+                    self.failed_tests.append()
                 else:
-                    self.success_test.append()
+                    self.success_tests.append()
 
     def assign(self, test_name: str, cmd: str, xs_path: str, stdout_file: str, stderr_file: str, threads: int = 16) -> bool:
         self.check_running()
-        if self.get_sever_load()[0] > self.cpu_cores + self.cpu_cores/5:
+        if not self.can_enqueue(threads, 10):
             return False
         moniter_file = generate_custom_path(stdout_file, 'moniter.txt')
         pwd = os.path.dirname(os.path.abspath(__file__))
@@ -171,16 +183,27 @@ class Server2:
         while True:
             time.sleep(1)
             res = proc.stdout.readline().decode()
-            print(res)
             try:
                 pid = int(res)
                 break
             except Exception:
                 pass
         case_ = Case(test_name, cmd, pid, moniter_file, self.conn, proc)
-        self.pending_test.append(case_)
+        self.pending_tests.append(case_)
         return True
 
+    def stop_case(self, name: str) -> bool:
+        res = search_by_name(self.pending_tests, name)
+        if res is not None:
+            self.pending_tests.remove()
+            res.kill()
+            return True
+        return False
+    
+    def stop_all(self) -> bool:
+        for i in self.pending_tests:
+            i.kill(self.username, self.ip)
+        self.pending_tests.clear()
         
     def max_free_core(self) -> int:
         # maybe negative
@@ -189,7 +212,7 @@ class Server2:
         return int(min(free_cores))
     
     def cur_tasks_num(self) -> int:
-        return len(self.pending_test)
+        return len(self.pending_tests)
     
 
 if __name__ == "__main__":
@@ -216,5 +239,9 @@ if __name__ == "__main__":
         s = Server2(ip)
         servers.append(s)
         print(f'ip: {ip}, avg load: {s.get_sever_load()}, can_enqueue: {s.can_enqueue(16)}, free_cores: {s.max_free_core()}')
-        s.assign('123', 'sleep 10 && echo 30', '123', f'{ip}out.txt', f'{ip}err.txt')
+    #     s.assign('123', 'sleep 1000s && echo 30', '123', f'{ip}out.txt', f'{ip}err.txt')
         
+    # for s in servers:
+    #     for i in s.pending_tests:
+    #         print(f'{s.ip}: {i.get_exit_code()}')
+    #         i.kill()

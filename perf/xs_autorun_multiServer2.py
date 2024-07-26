@@ -1,5 +1,3 @@
-#! /usr/bin/env python3
-
 import argparse
 import json
 import os
@@ -13,15 +11,20 @@ from multiprocessing import Process, Queue
 from gcpt import GCPT
 import perf
 import spec_score
-from server import Server
+from server2 import Server2
 from gcpt_run_time_eval import *
-# import AutoEmailAlert
+from typing import List
 
 tasks_dir = "SPEC06_EmuTasks_10_22_2021"
 perf_base_path = ""
 gcc12Enable = False
-emuArgR = "/nfs-nvme/home/share/zyy/shared_payloads/old-gcpt-restorer/gcpt.bin" # open01
-# emuArgR = "/nfs/home/share/liyanqin/old-gcpt-restorer/gcpt.bin" # node003
+emuArgR = "/nfs/home/share/liyanqin/old-gcpt-restorer/gcpt.bin" # node003
+
+servers_ip = [
+  '172.19.20.3',
+  '172.19.20.4',
+  '172.19.20.5',
+]
 
 def get_perf_base_path(xs_path):
   return os.path.join(xs_path, tasks_dir)
@@ -46,6 +49,7 @@ def load_all_gcpt(gcpt_path, json_path, server_num, threads, state_filter=None, 
       hour = get_eval_hour(benchspec, point, weight)
       gcpt = GCPT(gcpt_path, perf_base_path, benchspec, point, weight, hour, gcc12Enable)
       if state_filter is None and perf_filter is None:
+        hour_list.append(hour)
         all_gcpt.append(gcpt)
         continue
       perf_match, state_match = True, True
@@ -82,90 +86,6 @@ def load_all_gcpt(gcpt_path, json_path, server_num, threads, state_filter=None, 
     with open("gcpt.json", "w") as f:
       json.dump(json_dict, f)
   return all_gcpt
-
-
-def get_server(server_list):
-  l = []
-  for s in server_list.strip().split(" "):
-    l.append(Server(s))
-  return l
-
-def xs_run(server_list, workloads, xs_path, warmup, max_instr, threads):
-  emu_path = os.path.join(xs_path, "build/emu")
-  nemu_so_path = os.path.join(xs_path, "ready-to-run/riscv64-nemu-interpreter-so")
-  # nemu_so_path = os.path.join(xs_path, "ready-to-run/riscv64-spike-so")
-  if gcc12Enable:
-    base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '-W', str(warmup), '-I', str(max_instr), '-r', emuArgR, '-i']
-    #base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '--dump-db','-W', str(warmup), '-I', str(max_instr), '-r', emuArgR, '-i']
-  else:
-    base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '-W', str(warmup), '-I', str(max_instr), '-i']
-  # base_arguments = [emu_path, '--diff', nemu_so_path, '-W', str(warmup), '-I', str(max_instr), '-i']
-  # base_arguments = [emu_path, '-W', str(warmup), '-I', str(max_instr), '-i']
-  servers = get_server(server_list)
-  def server_all_free():
-    for s in servers:
-      if not s.is_free():
-        return False
-      return True
-
-  try:
-    max_num = len(workloads)
-    count = 0
-    for index in range(max_num):
-      workload = workloads[index]
-      random_seed = random.randint(0, 9999)
-      run_cmd = base_arguments + [workload.get_bin_path()] + ["-s", f"{random_seed}"]
-
-      if not os.path.exists(workload.get_res_dir()):
-        os.makedirs(workload.get_res_dir(), exist_ok=True)
-      assigned = False
-      while not assigned:
-        for s in servers:
-          if s.assign(f"{workload}", run_cmd, threads, xs_path, workload.get_out_path(), workload.get_err_path()):
-            assigned = True
-            count = count + 1
-            break
-        if not assigned:
-          time.sleep(1)
-          for s in servers:
-            s.check_running()
-      for s in servers:
-        s.check_running()
-
-    if not server_all_free():
-      print("Waiting for pending tests to finish")
-    while not server_all_free():
-      time.sleep(1)
-  except KeyboardInterrupt:
-    print("Interrupted. Exiting all programs ...")
-
-    pending_tests = []
-    success_tests= []
-    for s in servers:
-      s.stop()
-      print(f"{s.ip} stopped")
-      pending_tests = pending_tests + s.pending_tests()
-      success_tests = success_tests + s.success_tests
-    print(f"Finished {len(success_tests)}/{max_num}")
-    print(f"Not started {max_num - count}/{max_num}:")
-    if (count < max_num):
-      for i in range(count, max_num):
-        print(f"  ({i + 1 - count}) {workloads[i]}")
-    print(f"Not finished {len(pending_tests)}/{max_num}:")
-    for i, test in enumerate(pending_tests):
-      print(f"  ({i+1}) {test}")
-
-  failed_tests = []
-  for s in servers:
-    s.check_running()
-    # s.stop()
-    # print(f"{s.ip} stopped")
-    failed_tests = failed_tests + s.failed_tests
-  if len(failed_tests) > 0:
-    print(f"Errors {len(failed_tests)}/{max_num}:")
-    for i, test in enumerate(failed_tests):
-      print(f"  ({i + 1}) {test}")
-
 
 def get_all_manip():
     all_manip = []
@@ -244,11 +164,6 @@ def get_total_inst(benchspec, spec_version, isa):
       return int(line.split("instructions = ")[1].replace("\x1b[0m", ""))
   return None
 
-
-
-
-
-
 def xs_report_ipc(xs_path, gcpt_queue, result_queue):
   while not gcpt_queue.empty():
     gcpt = gcpt_queue.get()
@@ -261,6 +176,14 @@ def xs_report_ipc(xs_path, gcpt_queue, result_queue):
       result_queue.put([gcpt.benchspec, [float(gcpt.weight), float(counters["IPC"])]])
     else:
       print("IPC not found in", gcpt.benchspec, gcpt.point, gcpt.weight)
+
+def get_servers_load(s: List[Server2]) -> float:
+    server_num = len(s)
+    loads = []
+    for i in s:
+      load = i.get_sever_load()[0] / i.cpu_threads
+      loads.append(load if load <= 1 else 1)
+    return sum(loads) / server_num
 
 def xs_report(all_gcpt, xs_path, spec_version, isa, num_jobs, json_path = None):
   # frequency/GHz
@@ -305,7 +228,6 @@ def xs_report(all_gcpt, xs_path, spec_version, isa, num_jobs, json_path = None):
   print(f"Number of Checkpoints: {len(all_gcpt)}")
   print(f"SPEC CPU Version: SPEC CPU{spec_version}, {isa}")
 
-
 def xs_show(all_gcpt):
   for gcpt in all_gcpt:
     gcpt.show()
@@ -313,6 +235,82 @@ def xs_show(all_gcpt):
 def xs_debug(all_gcpt):
   for gcpt in all_gcpt:
     gcpt.debug()
+
+
+def xs_run(workloads, xs_path, warmup, max_instr, threads):
+  global servers_ip
+  emu_path = os.path.join(xs_path, "build/emu")
+  nemu_so_path = os.path.join(xs_path, "ready-to-run/riscv64-nemu-interpreter-so")
+  # nemu_so_path = os.path.join(xs_path, "ready-to-run/riscv64-spike-so")
+  if gcc12Enable:
+    base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '-W', str(warmup), '-I', str(max_instr), '-r', emuArgR, '-i']
+    #base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '--dump-db','-W', str(warmup), '-I', str(max_instr), '-r', emuArgR, '-i']
+  else:
+    base_arguments = [emu_path, '--diff', nemu_so_path, '--enable-fork', '-W', str(warmup), '-I', str(max_instr), '-i']
+  # base_arguments = [emu_path, '--diff', nemu_so_path, '-W', str(warmup), '-I', str(max_instr), '-i']
+  # base_arguments = [emu_path, '-W', str(warmup), '-I', str(max_instr), '-i']
+  servers = [Server2(ip) for ip in servers_ip]
+  total_load = get_servers_load(servers)
+  print(f'Cluster load: {total_load}')
+
+  try:
+    max_num = len(workloads)
+    count = 0
+    for index in range(max_num):
+      workload = workloads[index]
+      random_seed = random.randint(0, 9999)
+      run_cmd = base_arguments + [workload.get_bin_path()] + ["-s", f"{random_seed}"]
+      run_cmd = ' '.join(run_cmd)
+      print(f'current run_cmd: {run_cmd}')
+
+      if not os.path.exists(workload.get_res_dir()):
+        os.makedirs(workload.get_res_dir(), exist_ok=True)
+      assigned = False
+      while not assigned:
+        for s in servers:
+          if s.assign(f"{workload}", run_cmd, xs_path, workload.get_out_path(), workload.get_err_path()):
+            assigned = True
+            count = count + 1
+            break
+        if not assigned:
+          time.sleep(30)
+          for s in servers:
+            s.check_running()
+      time.sleep(90)
+      for s in servers:
+        s.check_running()
+
+  except:
+    print("Interrupted. Exiting all programs ...")
+
+    pending_tests = []
+    success_tests= []
+    for s in servers:
+      s.stop_all()
+      print(f"{s.ip} stopped")
+      pending_tests = pending_tests + s.pending_tests
+      success_tests = success_tests + s.success_tests
+    print(f"Finished {len(success_tests)}/{max_num}")
+    print(f"Not started {max_num - count}/{max_num}:")
+    if (count < max_num):
+      for i in range(count, max_num):
+        print(f"  ({i + 1 - count}) {workloads[i]}")
+    print(f"Not finished {len(pending_tests)}/{max_num}:")
+    for i, test in enumerate(pending_tests):
+      print(f"  ({i+1}) {test}")
+    sys.exit(0)
+
+  failed_tests = []
+  for s in servers:
+    s.check_running()
+    # s.stop()
+    # print(f"{s.ip} stopped")
+    failed_tests = failed_tests + s.failed_tests
+  if len(failed_tests) > 0:
+    print(f"Errors {len(failed_tests)}/{max_num}:")
+    for i, test in enumerate(failed_tests):
+      print(f"  ({i + 1}) {test}")
+
 
 if __name__ == "__main__":
   # python3 xs_autorun_v2.py  /nfs-nvme/home/share/checkpoints_profiles/spec06_rv64gcb_o2_20m/take_cpt /nfs-nvme/home/share/checkpoints_profiles/spec06_rv64gc_o2_20m/simpoint_coverage0.8_test.json --xs /nfs/home/username/XiangShan --threads 16 --dir SPEC06_EmuTasks_02_16_2023 -L "107 104"
@@ -352,27 +350,10 @@ if __name__ == "__main__":
   if args.ref is None:
     args.ref = args.xs
 
-  if args.server_list is None:
-    args.server_list = socket.gethostname()
-    server_num = 0
-  else:
-    server_num = len(args.server_list.strip().split(" "))
-
-
-  # gcpt = gcpt#[300:]#[::-1]
-  #gcpt = load_all_gcpt(args.gcpt_path, args.json_path,
-  #        state_filter=[GCPT.STATE_RUNNING, GCPT.STATE_NONE, GCPT.STATE_ABORTED], xs_path=args.ref)
-  #gcpt = gcpt[242:]#[::-1]
+  server_num = len(servers_ip)
 
   if args.show:
     gcpt = load_all_gcpt(args.gcpt_path, args.json_path, server_num, args.threads, xs_path = args.xs)
-    #gcpt = load_all_gcpt(args.gcpt_path, args.json_path,
-      #state_filter=[GCPT.STATE_FINISHED], xs_path=args.ref, sorted_by=lambda x: x.get_simulation_cps())
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: x.get_ipc())
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: x.benchspec.lower())
-      #state_filter=[GCPT.STATE_RUNNING], xs_path=args.ref, sorted_by=lambda x: x.benchspec.lower())
-      #state_filter=[GCPT.STATE_FINISHED], xs_path=args.ref, sorted_by=lambda x: -x.num_cycles)
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: -x.num_cycles)
     xs_show(gcpt)
   elif args.debug:
     gcpt = load_all_gcpt(args.gcpt_path, args.json_path, server_num, args.threads,
@@ -396,13 +377,6 @@ if __name__ == "__main__":
                          xs_path=args.xs,
                          sorted_by=lambda x:-x.eval_run_hours
                          )
-    #gcpt = load_all_gcpt(args.gcpt_path, args.json_path)
-    #gcpt = load_all_gcpt(args.gcpt_path, args.json_path,
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: -x.num_cycles)
-      #state_filter=[GCPT.STATE_FINISHED], xs_path=args.ref, sorted_by=lambda x: -x.num_cycles)
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: x.benchspec.lower())
-      #state_filter=[GCPT.STATE_ABORTED], xs_path=args.ref, sorted_by=lambda x: x.get_ipc())
-      #state_filter=[GCPT.STATE_RUNNING], xs_path=args.ref, sorted_by=lambda x: x.benchspec.lower())
     if (len(gcpt) == 0):
       print("All the tests are already finished.")
       print(f"perf_base_path: {perf_base_path}")
@@ -410,4 +384,4 @@ if __name__ == "__main__":
     print("All:  ", len(gcpt))
     print("First:", gcpt[0])
     print("Last: ", gcpt[-1])
-    xs_run(args.server_list, gcpt, args.xs, args.warmup, args.max_instr, args.threads)
+    xs_run(gcpt, args.xs, args.warmup, args.max_instr, args.threads)
